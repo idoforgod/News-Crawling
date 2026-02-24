@@ -203,6 +203,7 @@ _UA_POOL = [
 ### 3.6 복제 시 주의사항
 
 - `get_rotated_headers(extra_headers)`는 base UA에 extra를 **merge**한다. 크롤러에서 추가 헤더가 필요하면 여기서 주입.
+- **UA 로테이션 덮어쓰기 주의**: `robust_request` 재시도 시 `get_rotated_headers(headers)`를 호출하는데, 호출자가 전달한 `headers`에 `User-Agent` 키가 포함되어 있으면 새로 로테이션한 UA를 덮어쓴다. 현재 크롤러들은 `_get_headers()`로 이미 UA가 포함된 헤더를 전달하므로, 실질적으로 같은 URL의 재시도에서는 **동일한 UA**가 사용된다. 재시도마다 다른 UA를 강제하려면, 호출자가 UA 없이 추가 헤더만 전달하거나 `robust_request` 내부에서 UA를 항상 덮어쓰도록 수정해야 한다.
 - 초기 `_ua_index`는 `random.randint(0, len-1)`로 시작점을 랜덤화한다 → 여러 인스턴스가 동시에 돌아도 같은 UA로 시작하지 않음.
 
 ---
@@ -242,7 +243,8 @@ class SOTGuardian:
     │
     └─ save_article(article) 내부:
         ├─ 4대 필수 항목 검증: title, date, content, url
-        │   └─ 누락 시 → return False (거부)
+        │   조건: `not article.get(k)` → 키 누락뿐 아니라 빈 문자열("")/None도 거부
+        │   └─ 하나라도 falsy → return False (거부)
         │
         ├─ 내용 기반 지문 재검증:
         │   fingerprint = MD5(title + content[:100])
@@ -254,13 +256,30 @@ class SOTGuardian:
         │   └─ lang: 없으면 "ko"
         │
         └─ FileLock 획득 (timeout=10초) → 원자적 쓰기
-            ├─ JSONL append
+            ├─ JSONL append: json.dumps(article, ensure_ascii=False) + "\n"
+            │   (ensure_ascii=False: 한글이 유니코드 이스케이프 없이 원문 그대로 저장)
             ├─ seen_content_hashes.add(fingerprint)
             ├─ seen_urls.add(url)
             └─ return True
+
+        예외 처리:
+            ├─ filelock.Timeout → Lock 획득 시간 초과, return False
+            └─ Exception → 치명적 오류 로깅, return False
 ```
 
-### 4.4 해시 지문 생성 알고리즘
+### 4.4 공개 API: is_duplicate
+
+`save_article` 내부에서 자동으로 중복 검사가 수행되지만, 크롤러가 저장 전에 명시적으로 중복 여부만 확인하고 싶을 때 사용할 수 있는 별도 메서드가 존재한다:
+
+```python
+def is_duplicate(self, title: str, content: str) -> bool:
+    fingerprint = self._generate_fingerprint(title, content)
+    return fingerprint in self.seen_content_hashes
+```
+
+현재 크롤러에서는 직접 호출하지 않지만, 향후 "본문 추출 후 저장 전에 미리 걸러내기" 패턴에서 활용 가능하다.
+
+### 4.5 해시 지문 생성 알고리즘 (공통 핵심)
 
 ```python
 def _generate_fingerprint(title: str, content: str) -> str:
@@ -270,26 +289,30 @@ def _generate_fingerprint(title: str, content: str) -> str:
 
 **왜 content[:100]인가**: 전체 본문을 해싱하면 비용이 크고, 동일 기사의 약간 다른 버전(광고 텍스트 차이 등)을 놓칠 수 있다. 제목 + 본문 앞 100자는 기사의 **핵심 정체성**을 충분히 표현한다.
 
-### 4.5 초기화 시 기존 데이터 로드
+### 4.6 초기화 시 기존 데이터 로드
 
 ```python
 def _load_sot_hashes(self):
     hashes = set()
     urls = set()
     if os.path.exists(self.sot_path):
-        for line in open(sot_path):
-            data = json.loads(line)
-            if 'title' in data and 'content' in data:
-                hashes.add(self._generate_fingerprint(data['title'], data['content']))
-            if 'url' in data:
-                urls.add(data['url'])
+        with open(self.sot_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    if 'title' in data and 'content' in data:
+                        hashes.add(self._generate_fingerprint(data['title'], data['content']))
+                    if 'url' in data:
+                        urls.add(data['url'])
+                except json.JSONDecodeError:
+                    continue  # 손상된 줄은 건너뜀 (JSONL 복원력)
     self.seen_urls = urls
     return hashes
 ```
 
 **중요**: 프로그램 재시작 시에도 이전에 수집한 모든 데이터의 지문이 메모리에 로드된다. 따라서 동일 기사를 절대 중복 수집하지 않는다.
 
-### 4.6 핵심 상수
+### 4.7 핵심 상수
 
 | 상수 | 값 | 용도 |
 |------|-----|------|
@@ -298,10 +321,10 @@ def _load_sot_hashes(self):
 | FileLock timeout | 10초 | 동시성 제어 대기 한도 |
 | 필수 키 | title, date, content, url | 4대 절대 원칙 |
 
-### 4.7 복제 시 주의사항
+### 4.8 복제 시 주의사항
 
-- Singleton은 **같은 sot_path일 때만** 동일 인스턴스를 반환한다. 다른 도메인을 크롤링할 때 sot_path를 분리하면 별도의 Guardian이 생성된다.
-- `_instance = None`은 클래스 변수이므로, 테스트 시 `SOTGuardian._instance = None`으로 리셋해야 한다.
+- **Singleton은 sot_path를 무시한다**: `__new__`는 `_instance`가 존재하면 인자와 무관하게 기존 인스턴스를 반환한다. 따라서 최초 `SOTGuardian("path_a")` 호출 후 `SOTGuardian("path_b")`를 호출해도 `path_a`의 인스턴스가 반환된다. 다른 sot_path가 필요하면 반드시 `SOTGuardian._instance = None`으로 리셋 후 재생성해야 한다.
+- `_instance = None`은 클래스 변수이므로, 테스트 시 또는 sot_path 변경 시 `SOTGuardian._instance = None`으로 리셋해야 한다.
 - JSONL 형식은 **append-only**. 삭제/수정은 별도 관리 스크립트로 처리한다.
 
 ---
@@ -545,13 +568,16 @@ URL: https://news.google.com/rss/search?q={query}+when:1d&hl=ko&gl=KR&ceid=KR:ko
 
 [Tier 2] 웹 크롤링 폴백:
 URL A: https://news.google.com/search?q={query}+when:1d&hl=ko&gl=KR&ceid=KR:ko
-  → TotalWarScraper로 시도 (현재는 빈 결과 반환)
+  → TotalWarScraper로 시도
+  → TotalWar 성공/실패 모두 return [] (TotalWar는 {title,content}만 반환하므로
+    검색 결과 페이지에서 기사 URL 목록을 추출하는 용도로는 사용 불가)
+  → TotalWar 실패 시에만 아래 URL B로 폴백
 
 URL B: https://www.google.com/search?q={query}&tbm=nws&tbs=qdr:d
   → NetworkGuard.robust_request()
   → soup.select("a[href*='/url?']")
   → regex로 실제 URL 추출: /url?q=(https?://[^&]+)
-  → 제목 5자 이상만 유효
+  → 제목 6자 이상만 유효 (len(title) > 5)
 ```
 
 #### 본문 수집 — Google URL 디코딩 포함
@@ -772,6 +798,8 @@ raw = base64.urlsafe_b64decode(encoded)
 urls = []
 i = 0
 while i < len(raw):
+    if i + 1 >= len(raw):  # 경계 검사: 최소 2바이트 필요
+        break
     tag = raw[i]
     wire_type = tag & 0x07  # 하위 3비트 = wire type
 
@@ -788,10 +816,14 @@ while i < len(raw):
             if not (b & 0x80):
                 break
 
-        # 해당 길이만큼 문자열 추출
-        field_str = raw[i:i+length].decode('utf-8', errors='ignore')
-        if field_str.startswith('http'):
-            urls.append(field_str)
+        # 경계 검사 후 문자열 추출
+        if i + length <= len(raw):
+            try:
+                field_str = raw[i:i+length].decode('utf-8', errors='ignore')
+                if field_str.startswith('http'):
+                    urls.append(field_str)
+            except Exception:
+                pass
         i += length
 
     elif wire_type == 0:  # varint (숫자 필드, 건너뜀)
@@ -1012,14 +1044,20 @@ def main():
 
 ```
 requests>=2.31.0
+httpx>=0.25.0
+aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
-trafilatura>=1.6.0
-filelock>=3.12.0
+fake-useragent>=1.4.0
 selenium>=4.15.0
 undetected-chromedriver>=3.5.0
+pandas>=2.0.0
+trafilatura>=1.6.0
+filelock>=3.12.0
 googlenewsdecoder>=0.1.7
 ```
+
+> **참고**: `httpx`, `aiohttp`, `fake-useragent`, `pandas`는 현재 코드에서 직접 import하지 않으나, 확장 시 비동기 크롤링(httpx/aiohttp), UA 생성(fake-useragent), 데이터 분석(pandas)에 사용할 수 있도록 포함되어 있다.
 
 ### 13.2 각 패키지의 역할
 
